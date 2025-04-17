@@ -1,105 +1,103 @@
+from abc import ABC, abstractmethod
+from typing import List, Dict
 import pandas as pd
-import functools
+import numpy as np
+import concurrent.futures
+import textwrap
+from groq import Groq
 
-def load_data(file_path):
-    """Loads data from CSV, Excel, or JSON file."""
-    if file_path.endswith('.csv'):
-        return pd.read_csv(file_path)
-    elif file_path.endswith('.xlsx'):
-        return pd.read_excel(file_path, engine='openpyxl') 
-    elif file_path.endswith('.json'):
-        return pd.read_json(file_path)
-    raise ValueError("Unsupported file format")
 
-def detect_data_types(df):
-    """Detects data types and categorizes them into numerical, categorical, datetime, boolean, and text."""
-    data_types = {'numerical': [], 'categorical': [], 'datetime': [], 'boolean': [], 'text': []}
+class BaseRecommender(ABC):
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
 
-    for col in df.columns:
-        if pd.api.types.is_numeric_dtype(df[col]):
-            data_types['numerical'].append(col)
-        elif pd.api.types.is_datetime64_any_dtype(df[col]):
-            data_types['datetime'].append(col)
-        elif pd.api.types.is_bool_dtype(df[col]):
-            data_types['boolean'].append(col)
-        elif pd.api.types.is_string_dtype(df[col]):
-            data_types['text'].append(col)
-        else:
-            data_types['categorical'].append(col)  # Fallback for non-numeric non-text
+    @abstractmethod
+    def recommend_visualizations(self, n: int = 3) -> pd.DataFrame:
+        pass
 
-    return data_types
 
-def plot_decorator(func):
-    """Decorator to log and handle errors."""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            print(f"[ERROR] {e}")
-            return "Error in generating recommendation"
-    return wrapper
+class LLMVisualRecommender(BaseRecommender):
+    def __init__(self, df: pd.DataFrame, api_keys: dict):
+        super().__init__(df)
+        self.api_keys = api_keys
+        self.clients = {
+            'groq': Groq(api_key=self.api_keys.get("groq"))
+        }
+        self.model_ids = {
+            'llama3-70b': 'llama3-70b-8192',
+            'llama3-8b': 'llama3-8b-8192',
+            'llama3-versatile': 'llama-3.3-70b-versatile'
+        }
 
-@plot_decorator
-def recommend_plot(df):
-    """Recommends an appropriate plot based on data types in the dataset."""
-    data_types = detect_data_types(df)
+    def recommend_visualizations(self, n: int = 3) -> pd.DataFrame:
+        prompt = self._create_prompt(self._describe_dataframe())
+        responses = self._query_all_models(prompt)
+        parsed = [rec for resp in responses for rec in self._parse_llm_response(resp)]
+        unique = self._deduplicate(parsed)
+        return pd.DataFrame(unique[:n])
 
-    num_cols = data_types['numerical']
-    cat_cols = data_types['categorical']
-    time_cols = data_types['datetime']
-    bool_cols = data_types['boolean']
-    text_cols = data_types['text']
+    def _describe_dataframe(self) -> str:
+        desc = [
+            f"DataFrame Shape: {self.df.shape}",
+            f"Columns: {', '.join(self.df.columns)}"
+        ]
+        return '\n'.join(desc)
 
-    # Univariate Analysis
-    if len(num_cols) == 1 and not (cat_cols or time_cols or text_cols):
-        return "Recommended: Histogram"
+    def _create_prompt(self, df_description: str) -> str:
+        return textwrap.dedent(f"""
+        You are a data visualization expert analyzing this dataset:
 
-    if len(cat_cols) == 1 and not (num_cols or time_cols or text_cols):
-        return "Recommended: Bar Chart"
+        {df_description}
 
-    # Bivariate Analysis
-    if len(num_cols) == 2 and not (cat_cols or time_cols or text_cols):
-        return "Recommended: Scatter Plot"
+        Recommend 3 insightful visualizations for exploring this data.
+        For each recommendation, provide:
+        Plot Type: <type>
+        Variables: <var1, var2, ...>
+        Separate recommendations with '---'
+        """)
 
-    if len(num_cols) == 1 and len(cat_cols) == 1:
-        return "Recommended: Box Plot"
+    def _query_all_models(self, prompt: str) -> List[str]:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(self._query_llm, model_id, prompt)
+                for model_id in self.model_ids.values()
+            ]
+            return [f.result() for f in concurrent.futures.as_completed(futures)]
 
-    if len(time_cols) == 1 and len(num_cols) == 1:
-        return "Recommended: Line Chart"
+    def _query_llm(self, model_id: str, prompt: str) -> str:
+        response = self.clients['groq'].chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        return response.choices[0].message.content
 
-    # Multivariate Analysis (Three or More Numerical Columns)
-    if len(num_cols) >= 3 and not (cat_cols or time_cols or text_cols):
-        return "Recommended: Pairplot (Multivariate Analysis) or Heatmap"
+    def _parse_llm_response(self, response: str) -> List[Dict]:
+        results = []
+        for block in response.split('---'):
+            lines = [line.strip() for line in block.split('\n') if line.strip()]
+            if not lines or not lines[0].lower().startswith("plot type"):
+                continue
+            try:
+                plot_type = lines[0].split(":", 1)[1].strip().lower()
+                variables = [v.strip() for v in lines[1].split(":", 1)[1].split(',')]
+                valid_vars = [v for v in variables if v in self.df.columns]
+                if valid_vars:
+                    results.append({
+                        "Plot_Type": plot_type,
+                        "Variables": ', '.join(valid_vars)
+                    })
+            except Exception:
+                continue
+        return results
 
-    if len(num_cols) >= 3 and len(cat_cols) == 1:
-        return "Recommended: Pairplot (Grouped by Category), Box Plot, or Grouped Bar Chart"
-
-    if len(num_cols) == 2 and len(cat_cols) == 1:
-        return "Recommended: Regression Plot"
-
-    if len(num_cols) >= 2 and len(cat_cols) >= 1:
-        return "Recommended: Grouped Bar Chart or Violin Plot"
-
-    # Time-Series with Multiple Numerical Columns
-    if len(time_cols) == 1 and len(num_cols) > 1:
-        return "Recommended: Multi-Line Plot, Facet Grid, or Stacked Area Chart"
-
-    # Boolean Data
-    if bool_cols:
-        return "Recommended: Stacked Bar Chart or Count Plot for Boolean Data"
-
-    # Text Data
-    if text_cols:
-        return "Recommended: Word Cloud, Text Frequency Bar Chart, or Sentiment Analysis"
-
-    # Aggregated/Proportional Data
-    if len(cat_cols) == 1 and len(num_cols) == 1:
-        total_sum = df[num_cols[0]].sum()
-        return "Recommended: Pie Chart" if 0 < total_sum <= 100 else "Recommended: Bar Chart"
-
-    # High-Dimensional Data (More than 4+ Numerical Columns)
-    if len(num_cols) > 4:
-        return "Recommended: Parallel Coordinates Plot or PCA/t-SNE Visualization"
-
-    return "No suitable chart found. Recommend using the AI version."
+    def _deduplicate(self, items: List[Dict]) -> List[Dict]:
+        seen = set()
+        unique = []
+        for item in items:
+            key = (item['Plot_Type'], item['Variables'])
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique
